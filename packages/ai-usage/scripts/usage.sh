@@ -128,7 +128,7 @@ add_window() {
     percent=$((100 - used))
   fi
   fraction=$(awk -v percent="$percent" 'BEGIN { printf "%.2f", percent / 100 }')
-  reset=""
+  reset=$5
   countdown=""
   pace=""
   # A reset that has passed belongs to a saved response; the next refresh brings the new window.
@@ -182,6 +182,8 @@ add_provider() {
 claude_usage() {
   token=$(read_json claudeAiOauth.accessToken)
   plan=$(read_json claudeAiOauth.subscriptionType)
+  # Max 20x, now called Ultra, shares the subscription type "max" with Max 5x; only the tier tells them apart.
+  tier=$(read_json claudeAiOauth.rateLimitTier 2>/dev/null) || tier=""
   expires=$(read_json claudeAiOauth.expiresAt)
   if [ $((expires / 1000)) -le "$now" ]; then
     use_saved "Claude Code's sign-in has expired; open Claude Code to renew it"
@@ -191,10 +193,16 @@ claude_usage() {
   fi
   [ -n "$json" ] || return 0
   total=$(read_json limits)
-  # Claude reports no session until one starts, so a session that hasn't started is unused.
-  i=0
-  while [ "$i" -lt "$total" ] && [ "$(read_json "limits.$i.kind")" != session ]; do i=$((i + 1)); done
-  [ "$i" -lt "$total" ] || add_window Session session 0 ""
+  # Claude reports no session until one starts, so on plans with a 5-hour limit the row says it hasn't
+  # started. Ultra (tier max_20x) has no 5-hour limit since 30 October 2026, so it gets no row.
+  case $tier in
+    *max_20x*) ;;
+    *)
+      i=0
+      while [ "$i" -lt "$total" ] && [ "$(read_json "limits.$i.kind")" != session ]; do i=$((i + 1)); done
+      [ "$i" -lt "$total" ] || add_window Session session 0 "" "Not started"
+      ;;
+  esac
   i=0
   while [ "$i" -lt "$total" ]; do
     used=$(read_json "limits.$i.percent")
@@ -219,7 +227,7 @@ claude_usage() {
       fraction=$(awk -v spent="$spent" -v limit="$limit" -v usage="$counted" \
         'BEGIN { used = spent / limit; if (used > 1) used = 1; if (usage != "used") used = 1 - used; printf "%.2f", used }')
       detail=$(awk -v spent="$spent" -v limit="$limit" 'BEGIN { printf "%.2f / %.2f", spent / 100, limit / 100 }')
-      rows="$rows,{\"title\":\"Extra usage\",\"fraction\":\"$fraction\",\"detail\":\"$detail $currency\",\"trailing\":\"This month\"}"
+      rows="$rows${rows:+,}{\"title\":\"Extra usage\",\"fraction\":\"$fraction\",\"detail\":\"$detail $currency\",\"trailing\":\"This month\"}"
     fi
   fi
 }
