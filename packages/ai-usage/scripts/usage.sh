@@ -262,10 +262,14 @@ account_done() {
 
 # Reads the usage of the Claude Code account whose Keychain sign-in is in $json.
 claude_usage() {
-  token=$(read_json claudeAiOauth.accessToken)
-  plan=$(read_json claudeAiOauth.subscriptionType)
-  expires=$(read_json claudeAiOauth.expiresAt)
-  if [ $((expires / 1000)) -le "$now" ]; then
+  token=$(read_json claudeAiOauth.accessToken 2>/dev/null || true)
+  plan=$(read_json claudeAiOauth.subscriptionType 2>/dev/null || true)
+  expires=$(read_json claudeAiOauth.expiresAt 2>/dev/null || true)
+  case $expires in '' | *[!0-9]*) expires=0 ;; esac
+  # A sign-in without a token, such as one the Keychain gave back damaged, is a note, not a failure.
+  if [ -z "$token" ]; then
+    json="" note="StableBar couldn't read Claude Code's sign-in from the Keychain."
+  elif [ $((expires / 1000)) -le "$now" ]; then
     use_saved "Claude Code's sign-in has expired; open Claude Code to renew it"
   else
     fetch "https://api.anthropic.com/api/oauth/usage" <<END
@@ -347,9 +351,12 @@ if $show_claude; then
   elif [ "$status" = 44 ]; then
     echo "Claude Code isn't signed in on this Mac. Sign in to Claude Code to see its limits." >&2
     exit 1
-  elif [ "$status" != 0 ]; then
+  elif [ "$status" != 0 ] && ! $both; then
     echo "StableBar couldn't read Claude Code's sign-in from the Keychain." >&2
     exit 1
+  elif [ "$status" != 0 ]; then
+    # With other providers on, a sign-in that can't be read is a note in Claude's section.
+    credentials=""
   fi
 fi
 
