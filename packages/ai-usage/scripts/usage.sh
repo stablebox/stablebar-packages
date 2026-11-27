@@ -25,6 +25,15 @@ epoch() {
   date -j -f %Y-%m-%dT%H:%M:%S%z "$(printf '%s' "$1" | cut -c 1-19)${zone:-+0000}" +%s
 }
 
+# Formats epoch $1 as HH:MM when it's today, or "Mon 18:15" when it's another day.
+when_time() {
+  if [ "$(date -r "$1" +%Y-%m-%d)" = "$(date -r "$now" +%Y-%m-%d)" ]; then
+    date -r "$1" +%H:%M
+  else
+    date -r "$1" '+%a %H:%M'
+  fi
+}
+
 weekly_pace() {
   elapsed=$((604800 - $2))
   [ "$elapsed" -gt 0 ] || elapsed=0
@@ -149,17 +158,28 @@ in_bar() {
   return 1
 }
 
-# Adds window $2 (session, weekly, or another kind the bar doesn't show) titled $1, with $3 percent used,
-# resetting at $4, if known. A fifth argument, "popup", keeps it off the bar.
+# Adds window $2 (session, weekly, or another kind the bar doesn't show) titled $1, with $3 percent used
+# (or empty when unknown after a passed reset), resetting at $4, if known. A fifth argument, "popup",
+# keeps it off the bar.
 add_window() {
   title=$(json_escape "$1")
-  used=$(awk -v used="$3" 'BEGIN { printf "%.0f", used }')
-  if [ "$counted" = used ]; then
-    percent=$used
+  if [ -z "$3" ]; then
+    fraction="0.00"
+    detail="–"
+    bar_percent="–"
+    label_text="–"
   else
-    percent=$((100 - used))
+    used=$(awk -v used="$3" 'BEGIN { printf "%.0f", used }')
+    if [ "$counted" = used ]; then
+      percent=$used
+    else
+      percent=$((100 - used))
+    fi
+    fraction=$(awk -v percent="$percent" 'BEGIN { printf "%.2f", percent / 100 }')
+    detail="$percent% $counted"
+    bar_percent="$percent%"
+    label_text="$percent% $counted"
   fi
-  fraction=$(awk -v percent="$percent" 'BEGIN { printf "%.2f", percent / 100 }')
   reset=""
   countdown=""
   pace=""
@@ -171,7 +191,7 @@ add_window() {
     reset="Resets in $countdown"
     # Pace is noise in the first 3% of the week. Weekly windows are taken to last 7 days, as Claude's,
     # Codex's and Antigravity's do.
-    if [ "$2" = weekly ] && [ $((604800 - ($4 - now))) -ge 18144 ]; then
+    if [ "$2" = weekly ] && [ -n "$3" ] && [ $((604800 - ($4 - now))) -ge 18144 ]; then
       pace=$(weekly_pace "$3" $(($4 - now)))
       # A mark on the meter where it would be on pace: popup meters are 262 points wide and the bar's
       # 20, each with its 2- or 1.5-point mark after it.
@@ -186,15 +206,15 @@ add_window() {
     # the reset is then more than a minute old, so it's fetched again.
     [ $(($4 - now + 60)) -ge "$interval" ] || interval=$(($4 - now + 60))
   fi
-  rows="$rows${rows:+,}{\"title\":\"$title\",\"fraction\":\"$fraction\",\"detail\":\"$percent% $counted\",\"trailing\":\"$reset\",\"pace\":\"$pace\",\"brand\":\"$brand\"${mark:+,\"paceMark\":\"1\",\"paceAt\":\"$mark\"}}"
+  rows="$rows${rows:+,}{\"title\":\"$title\",\"fraction\":\"$fraction\",\"detail\":\"$detail\",\"trailing\":\"$reset\",\"pace\":\"$pace\",\"brand\":\"$brand\"${mark:+,\"paceMark\":\"1\",\"paceAt\":\"$mark\"}}"
   if [ "$5" != popup ] && in_bar "$2"; then
-    summary="$summary${summary:+ · }$provider $2 $percent% $counted"
-    line="$line${line:+ · }$2 $percent% $counted"
+    summary="$summary${summary:+ · }$provider $2 $label_text"
+    line="$line${line:+ · }$2 $label_text"
     label=W
     [ "$2" = session ] && label=5h
     group="$group\"${2}Label\":\"$label\","
     [ "$METERS" = Hide ] || group="$group\"${2}Meter\":\"$fraction\","
-    [ "$PERCENTAGES" = Hide ] || group="$group\"${2}Percent\":\"$percent%\","
+    [ "$PERCENTAGES" = Hide ] || group="$group\"${2}Percent\":\"$bar_percent\","
     # A window without a countdown, such as a session that hasn't started, keeps its line in the
     # stacked layout, so the week's countdown stays on the week's line.
     [ "$RESET_TIMES" = Hide ] || group="$group\"${2}Reset\":\"${countdown:-–}\","
@@ -245,7 +265,7 @@ add_provider() {
   fi
   # A line from a saved response says when it was fetched.
   if [ -n "$line" ] && { [ -n "$note" ] || $expired_idle; }; then
-    line="$line · as of $(date -r "$data_time" +%H:%M)"
+    line="$line · as of $(when_time "$data_time")"
   fi
   # A provider on the bar without any of the limits it shows, such as only a week with Session chosen,
   # says so.
@@ -383,39 +403,35 @@ read_antigravity_signin() {
   esac
 }
 
-# Finds an installed Antigravity CLI binary to renew an expired 1-hour OAuth access token.
+# Finds the Antigravity CLI (`agy`), skipping any symlink into a macOS .app bundle so a desktop app
+# launcher isn't started from the bar.
 find_antigravity_cli() {
-  for candidate in antigravity agy; do
-    if bin=$(command -v "$candidate" 2>/dev/null) && [ -x "$bin" ]; then
-      printf '%s' "$bin"
-      return 0
-    fi
-  done
   for candidate in \
-    "$HOME/.local/bin/agy" "$HOME/.local/bin/antigravity" \
-    "$HOME/.antigravity/bin/agy" "$HOME/.antigravity/bin/antigravity" \
-    /opt/homebrew/bin/agy /opt/homebrew/bin/antigravity \
-    /usr/local/bin/agy /usr/local/bin/antigravity; do
-    if [ -x "$candidate" ]; then
-      printf '%s' "$candidate"
-      return 0
-    fi
+    "$(command -v agy 2>/dev/null || true)" \
+    "$HOME/.local/bin/agy" \
+    /opt/homebrew/bin/agy \
+    /usr/local/bin/agy; do
+    [ -n "$candidate" ] && [ -x "$candidate" ] || continue
+    target=$candidate
+    depth=0
+    while [ -L "$target" ] && [ "$depth" -lt 10 ]; do
+      link=$(readlink "$target" 2>/dev/null || true)
+      [ -n "$link" ] || break
+      case $link in
+        /*) target=$link ;;
+        *) target="$(dirname "$target")/$link" ;;
+      esac
+      depth=$((depth + 1))
+    done
+    case $target in *.app/* | *.app) continue ;; esac
+    printf '%s' "$candidate"
+    return 0
   done
-  newest=""
-  newest_time=0
-  for candidate in "$HOME"/.t3/tools/antigravity-acp/*/versions/*/antigravity; do
-    [ -x "$candidate" ] || continue
-    mtime=$(stat -f %m "$candidate" 2>/dev/null || echo 0)
-    if [ "$mtime" -ge "$newest_time" ]; then
-      newest=$candidate
-      newest_time=$mtime
-    fi
-  done
-  [ -n "$newest" ] && printf '%s' "$newest"
+  return 1
 }
 
-# Asks the local Antigravity CLI to refresh its 1-hour access token in Keychain, using its saved
-# refresh token. Capped to a few seconds and backed off on failure so it never stalls the widget.
+# Asks the local Antigravity CLI (`agy`) to refresh its 1-hour access token in Keychain, using its
+# saved refresh token. Capped to a few seconds and backed off on failure so it never stalls the widget.
 renew_antigravity_signin() {
   refresh_wait="$CONFIG_DIR/ai-usage-antigravity-refresh-wait"
   if [ -f "$refresh_wait" ] && [ "$now" -lt "$(cat "$refresh_wait")" ]; then
@@ -429,16 +445,25 @@ renew_antigravity_signin() {
   [ "$left" -ge 5 ] || return 1
   cap=$((left - 2))
   [ "$cap" -le 6 ] || cap=6
-  "$cli" models </dev/null >/dev/null 2>&1 &
+  (cd / && AGY_CLI_DISABLE_AUTO_UPDATE=true exec "$cli" models) </dev/null >/dev/null 2>&1 &
   cli_pid=$!
-  waited=0
-  while kill -0 "$cli_pid" 2>/dev/null && [ "$waited" -lt "$cap" ]; do
-    sleep 1
-    waited=$((waited + 1))
+  ticks=0
+  limit=$((cap * 5))
+  while kill -0 "$cli_pid" 2>/dev/null && [ "$ticks" -lt "$limit" ]; do
+    sleep 0.2
+    ticks=$((ticks + 1))
   done
   cli_status=0
   if kill -0 "$cli_pid" 2>/dev/null; then
     kill "$cli_pid" 2>/dev/null || true
+    grace=0
+    while kill -0 "$cli_pid" 2>/dev/null && [ "$grace" -lt 5 ]; do
+      sleep 0.2
+      grace=$((grace + 1))
+    done
+    if kill -0 "$cli_pid" 2>/dev/null; then
+      kill -9 "$cli_pid" 2>/dev/null || true
+    fi
     wait "$cli_pid" 2>/dev/null || true
     cli_status=124
   else
@@ -449,7 +474,7 @@ renew_antigravity_signin() {
     if [ "$signin_status" = 0 ]; then
       new_token=$(printf '%s' "$signin" | plutil -extract token.access_token raw -o - - 2>/dev/null || true)
       new_expires=$(epoch "$(printf '%s' "$signin" | plutil -extract token.expiry raw -o - - 2>/dev/null || true)" 2>/dev/null || true)
-      if [ -n "$new_token" ] && { [ -z "$new_expires" ] || [ "$new_expires" -gt "$now" ]; }; then
+      if [ -n "$new_token" ] && [ "$new_token" != "$token" ] && { [ -z "$new_expires" ] || [ "$new_expires" -gt "$now" ]; }; then
         token=$new_token
         expires=$new_expires
         rm -f "$refresh_wait"
@@ -596,9 +621,14 @@ if $show_antigravity; then
       elif [ -f "$saved" ]; then
         json=$(cat "$saved")
         data_time=$(stat -f %m "$saved")
-        note=""
-        notice="Antigravity is idle; showing limits from $(date -r "$data_time" +%H:%M). Open Antigravity to refresh."
+        since=$(when_time "$data_time")
         expired_idle=true
+        if [ $((now - data_time)) -lt 18000 ]; then
+          note=""
+          notice="Antigravity hasn't run on this Mac since $since. Open Antigravity to refresh."
+        else
+          note="Antigravity hasn't run on this Mac since $since; open Antigravity to refresh."
+        fi
       else
         json=""
         note="Antigravity's sign-in has expired; open Antigravity to renew it."
@@ -610,8 +640,8 @@ if $show_antigravity; then
 Authorization: Bearer $token
 User-Agent: antigravity
 END
-      # If the token was rejected before expiry was known, renew once through the CLI and retry.
-      if ! $renewed && { [ "$fetch_status" = 401 ] || [ "$fetch_status" = 403 ]; } && renew_antigravity_signin; then
+      # If the token was rejected while its expiry was unknown, renew once through the CLI and retry.
+      if ! $renewed && [ -z "$expires" ] && { [ "$fetch_status" = 401 ] || [ "$fetch_status" = 403 ]; } && renew_antigravity_signin; then
         fetch "https://aicode.googleapis.com/v1alpha/remote:getUserQuotaSummary" <<END
 Authorization: Bearer $token
 User-Agent: antigravity
@@ -664,9 +694,9 @@ END
           # A window that hasn't started has no reset time.
           resets=$(read_json "$at.resetTime" 2>/dev/null || true)
           [ -z "$resets" ] || resets=$(epoch "$resets" 2>/dev/null || true)
-          # While Antigravity is idle, a window whose reset time has already passed has reset.
+          # While Antigravity hasn't run on this Mac, a window whose reset time has already passed is unknown.
           if $expired_idle && [ -n "$resets" ] && [ "$resets" -le "$now" ]; then
-            used=0
+            used=""
             resets=""
           fi
           # Only the shown group's limits go on the bar.

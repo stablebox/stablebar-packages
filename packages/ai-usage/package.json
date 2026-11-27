@@ -2,7 +2,7 @@
   "id": "ai-usage",
   "name": "AI usage",
   "version": "1.5.1",
-  "description": "Shows your Claude Code, Codex and Antigravity limits in one widget, with reset countdowns and weekly pace, using the sign-ins those tools already keep.",
+  "description": "Shows your Claude Code, Codex and Antigravity limits in one widget, with reset countdowns and weekly pace, using the sign-ins those tools already keep and renewing Antigravity's sign-in with its CLI (agy) when installed.",
   "author": "Seb-GRAF",
   "repository": "https://github.com/Seb-GRAF/stablebar-packages",
   "entry": "config.json",
