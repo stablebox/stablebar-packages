@@ -7,7 +7,7 @@
   "repository": "https://github.com/Seb-GRAF/stablebar-packages",
   "entry": "config.json",
   "screenshot": "preview.png",
-  "hosts": ["api.anthropic.com", "chatgpt.com", "aicode.googleapis.com"],
+  "hosts": ["api.anthropic.com", "chatgpt.com", "aicode.googleapis.com", "oauth2.googleapis.com"],
   "settings": {
     "claude": {
       "type": "string", "title": "Claude", "default": "Session and week", "choices": ["Session and week", "Session", "Week", "Off"],
