@@ -75,7 +75,8 @@ fetch() {
   result=$(curl -sS --max-time "$share" -H @- -o "$saved.part" -w '%{http_code} %header{retry-after}' "$@") || curl_status=$?
   # A transfer cut short, such as by the deadline, can still report 200; keep the saved response then.
   [ "$curl_status" = 0 ] || result="000 "
-  case ${result%% *} in
+  fetch_status=${result%% *}
+  case $fetch_status in
     200)
       mv "$saved.part" "$saved"
       json=$(cat "$saved")
@@ -122,6 +123,7 @@ tooltip=""
 line=""
 # A note in a provider's popup section that, unlike $note, doesn't dim it on the bar.
 notice=""
+expired_idle=false
 # The output styles that place pace marks.
 pace_styles=""
 popup=""
@@ -242,13 +244,16 @@ add_provider() {
     failures="$failures${failures:+ }$note"
   fi
   # A line from a saved response says when it was fetched.
-  [ -z "$note" ] || [ -z "$line" ] || line="$line · as of $(date -r "$data_time" +%H:%M)"
+  if [ -n "$line" ] && { [ -n "$note" ] || $expired_idle; }; then
+    line="$line · as of $(date -r "$data_time" +%H:%M)"
+  fi
   # A provider on the bar without any of the limits it shows, such as only a week with Session chosen,
   # says so.
   [ -z "$json" ] || [ -n "$line" ] || line="none of the limits the bar shows; click for the others"
   [ -z "$line" ] || tooltip="$tooltip${tooltip:+\\n}$provider: $line"
   line=""
   notice=""
+  expired_idle=false
   rows=""
   group=""
   account_done
@@ -369,15 +374,99 @@ if $show_codex && [ ! -f "$HOME/.codex/auth.json" ]; then
   show_codex=false
 fi
 
+# Reads Antigravity's Google sign-in from the Keychain, decoding go-keyring-base64 if present.
+read_antigravity_signin() {
+  signin_status=0
+  signin=$(security find-generic-password -s gemini -a antigravity -w 2>/dev/null) || signin_status=$?
+  case $signin in
+    go-keyring-base64:*) signin=$(printf '%s' "${signin#go-keyring-base64:}" | base64 -D 2>/dev/null) || signin="" ;;
+  esac
+}
+
+# Finds an installed Antigravity CLI binary to renew an expired 1-hour OAuth access token.
+find_antigravity_cli() {
+  for candidate in antigravity agy; do
+    if bin=$(command -v "$candidate" 2>/dev/null) && [ -x "$bin" ]; then
+      printf '%s' "$bin"
+      return 0
+    fi
+  done
+  for candidate in \
+    "$HOME/.local/bin/agy" "$HOME/.local/bin/antigravity" \
+    "$HOME/.antigravity/bin/agy" "$HOME/.antigravity/bin/antigravity" \
+    /opt/homebrew/bin/agy /opt/homebrew/bin/antigravity \
+    /usr/local/bin/agy /usr/local/bin/antigravity; do
+    if [ -x "$candidate" ]; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  newest=""
+  newest_time=0
+  for candidate in "$HOME"/.t3/tools/antigravity-acp/*/versions/*/antigravity; do
+    [ -x "$candidate" ] || continue
+    mtime=$(stat -f %m "$candidate" 2>/dev/null || echo 0)
+    if [ "$mtime" -ge "$newest_time" ]; then
+      newest=$candidate
+      newest_time=$mtime
+    fi
+  done
+  [ -n "$newest" ] && printf '%s' "$newest"
+}
+
+# Asks the local Antigravity CLI to refresh its 1-hour access token in Keychain, using its saved
+# refresh token. Capped to a few seconds and backed off on failure so it never stalls the widget.
+renew_antigravity_signin() {
+  refresh_wait="$CONFIG_DIR/ai-usage-antigravity-refresh-wait"
+  if [ -f "$refresh_wait" ] && [ "$now" -lt "$(cat "$refresh_wait")" ]; then
+    return 1
+  fi
+  refresh_token=$(printf '%s' "$signin" | plutil -extract token.refresh_token raw -o - - 2>/dev/null || true)
+  [ -n "$refresh_token" ] || return 1
+  cli=$(find_antigravity_cli 2>/dev/null || true)
+  [ -n "$cli" ] || return 1
+  left=$((deadline - $(date +%s)))
+  [ "$left" -ge 5 ] || return 1
+  cap=$((left - 2))
+  [ "$cap" -le 6 ] || cap=6
+  "$cli" models </dev/null >/dev/null 2>&1 &
+  cli_pid=$!
+  waited=0
+  while kill -0 "$cli_pid" 2>/dev/null && [ "$waited" -lt "$cap" ]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+  cli_status=0
+  if kill -0 "$cli_pid" 2>/dev/null; then
+    kill "$cli_pid" 2>/dev/null || true
+    wait "$cli_pid" 2>/dev/null || true
+    cli_status=124
+  else
+    wait "$cli_pid" 2>/dev/null || cli_status=$?
+  fi
+  if [ "$cli_status" = 0 ]; then
+    read_antigravity_signin
+    if [ "$signin_status" = 0 ]; then
+      new_token=$(printf '%s' "$signin" | plutil -extract token.access_token raw -o - - 2>/dev/null || true)
+      new_expires=$(epoch "$(printf '%s' "$signin" | plutil -extract token.expiry raw -o - - 2>/dev/null || true)" 2>/dev/null || true)
+      if [ -n "$new_token" ] && { [ -z "$new_expires" ] || [ "$new_expires" -gt "$now" ]; }; then
+        token=$new_token
+        expires=$new_expires
+        rm -f "$refresh_wait"
+        return 0
+      fi
+    fi
+  fi
+  echo $((now + 900)) > "$refresh_wait"
+  return 1
+}
+
 # Antigravity keeps its Google sign-in in the Keychain, as JSON or as "go-keyring-base64:" and the JSON
 # in Base64. With other providers on, a sign-in that can't be read is a note in Antigravity's section.
 signin_problem=""
 if $show_antigravity; then
-  status=0
-  signin=$(security find-generic-password -s gemini -a antigravity -w 2>/dev/null) || status=$?
-  case $signin in
-    go-keyring-base64:*) signin=$(printf '%s' "${signin#go-keyring-base64:}" | base64 -D 2>/dev/null) || signin="" ;;
-  esac
+  read_antigravity_signin
+  status=$signin_status
   if [ "$status" = 44 ] && $both; then
     show_antigravity=false
   elif [ "$status" = 44 ]; then
@@ -486,11 +575,13 @@ fi
 
 # Antigravity groups the models that share limits, such as Gemini Models and Claude and GPT models,
 # each with a 5-hour and a weekly limit. The bar shows the group the setting names, and the popup every
-# group. Antigravity renews its sign-in, which lasts an hour, while it runs.
+# group. Google access tokens last an hour; when expired, try renewing through the local CLI first,
+# and otherwise show the last saved limits calmly while Antigravity is idle.
 if $show_antigravity; then
   provider=Antigravity app=Antigravity brand=antigravity host=aicode.googleapis.com saved="$CONFIG_DIR/ai-usage-antigravity-quota.json"
   limits=$ANTIGRAVITY
   plan=""
+  expired_idle=false
   if [ -n "$signin_problem" ]; then
     json="" note=$signin_problem
   else
@@ -498,13 +589,34 @@ if $show_antigravity; then
     token=$(read_json token.access_token)
     # An expiry that's missing or unreadable is unknown: the request then tells whether it still works.
     expires=$(epoch "$(read_json token.expiry 2>/dev/null || true)" 2>/dev/null || true)
+    renewed=false
     if [ -n "$expires" ] && [ "$expires" -le "$now" ]; then
-      use_saved "Antigravity's sign-in has expired; open Antigravity to renew it"
-    else
+      if renew_antigravity_signin; then
+        renewed=true
+      elif [ -f "$saved" ]; then
+        json=$(cat "$saved")
+        data_time=$(stat -f %m "$saved")
+        note=""
+        notice="Antigravity is idle; showing limits from $(date -r "$data_time" +%H:%M). Open Antigravity to refresh."
+        expired_idle=true
+      else
+        json=""
+        note="Antigravity's sign-in has expired; open Antigravity to renew it."
+      fi
+    fi
+    if ! $expired_idle && [ -n "$json" ]; then
+      fetch_status=""
       fetch "https://aicode.googleapis.com/v1alpha/remote:getUserQuotaSummary" <<END
 Authorization: Bearer $token
 User-Agent: antigravity
 END
+      # If the token was rejected before expiry was known, renew once through the CLI and retry.
+      if ! $renewed && { [ "$fetch_status" = 401 ] || [ "$fetch_status" = 403 ]; } && renew_antigravity_signin; then
+        fetch "https://aicode.googleapis.com/v1alpha/remote:getUserQuotaSummary" <<END
+Authorization: Bearer $token
+User-Agent: antigravity
+END
+      fi
     fi
   fi
   if [ -n "$json" ]; then
@@ -522,7 +634,7 @@ END
     done
     if [ -z "$shown" ] && [ "$total" -gt 0 ]; then
       shown=0
-      notice="Antigravity lists no $ANTIGRAVITY_MODELS models, so the bar shows $(read_json "$groups.0.displayName" 2>/dev/null || printf 'its first group')."
+      notice="${notice:+$notice }Antigravity lists no $ANTIGRAVITY_MODELS models, so the bar shows $(read_json "$groups.0.displayName" 2>/dev/null || printf 'its first group')."
     fi
     # The tooltip names the group the bar shows.
     models=$(read_json "$groups.${shown:-0}.displayName" 2>/dev/null | sed 's/ [Mm]odels$//' || true)
@@ -552,6 +664,11 @@ END
           # A window that hasn't started has no reset time.
           resets=$(read_json "$at.resetTime" 2>/dev/null || true)
           [ -z "$resets" ] || resets=$(epoch "$resets" 2>/dev/null || true)
+          # While Antigravity is idle, a window whose reset time has already passed has reset.
+          if $expired_idle && [ -n "$resets" ] && [ "$resets" -le "$now" ]; then
+            used=0
+            resets=""
+          fi
           # Only the shown group's limits go on the bar.
           where=popup
           [ "$g" != "$shown" ] || where=bar
