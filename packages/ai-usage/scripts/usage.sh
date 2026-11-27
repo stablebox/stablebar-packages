@@ -19,6 +19,12 @@ duration() {
   fi
 }
 
+# Seconds since 1970 of an RFC 3339 time, such as 2026-11-27T09:35:35.700894+01:00 or 2026-11-27T08:35:35Z.
+epoch() {
+  zone=$(printf '%s' "$1" | sed -n 's/.*\([+-][0-9][0-9]\):\{0,1\}\([0-9][0-9]\)$/\1\2/p')
+  date -j -f %Y-%m-%dT%H:%M:%S%z "$(printf '%s' "$1" | cut -c 1-19)${zone:-+0000}" +%s
+}
+
 weekly_pace() {
   elapsed=$((604800 - $2))
   [ "$elapsed" -gt 0 ] || elapsed=0
@@ -38,7 +44,8 @@ weekly_pace() {
   fi
 }
 
-# Sets $json to the usage response for the curl arguments, saving it in $saved. When the request fails,
+# Sets $json to the usage response for the curl arguments, saving it in $saved. The request's headers
+# come on standard input, one per line, so that a token never shows in the process list. When the request fails,
 # it uses the response an earlier run saved, if any, and $note says why. $data_time is when it was fetched.
 fetch() {
   wait_file="${saved%.json}-wait"
@@ -54,7 +61,20 @@ fetch() {
     note=""
     return
   fi
-  result=$(curl -sS --max-time 12 -o "$saved.part" -w '%{http_code} %header{retry-after}' "$@") || true
+  # Every request shares the widget's 30-second timeout, so that the output arrives with what's saved:
+  # each gets an equal share of the time left with the accounts still to come, up to 12 seconds.
+  left=$((deadline - $(date +%s)))
+  if [ "$left" -lt 2 ]; then
+    use_saved "There was no time left to reach $host"
+    return
+  fi
+  share=$((left / pending))
+  [ "$share" -ge 2 ] || share=2
+  [ "$share" -le 12 ] || share=12
+  curl_status=0
+  result=$(curl -sS --max-time "$share" -H @- -o "$saved.part" -w '%{http_code} %header{retry-after}' "$@") || curl_status=$?
+  # A transfer cut short, such as by the deadline, can still report 200; keep the saved response then.
+  [ "$curl_status" = 0 ] || result="000 "
   case ${result%% *} in
     200)
       mv "$saved.part" "$saved"
@@ -91,11 +111,19 @@ use_saved() {
 }
 
 now=$(date +%s)
+deadline=$((now + 25))
 # The next refresh, in seconds, from a choice such as "Every 5 minutes".
 interval=$(($(printf '%s' "$REFRESH" | tr -cd '0-9') * 60))
 updated=$now
 failures=""
 summary=""
+# The tooltip: a line per provider, with the limits the bar shows.
+tooltip=""
+line=""
+# A note in a provider's popup section that, unlike $note, doesn't dim it on the bar.
+notice=""
+# The output styles that place pace marks.
+pace_styles=""
 popup=""
 rows=""
 group=""
@@ -119,6 +147,8 @@ in_bar() {
   return 1
 }
 
+# Adds window $2 (session, weekly, or another kind the bar doesn't show) titled $1, with $3 percent used,
+# resetting at $4, if known. A fifth argument, "popup", keeps it off the bar.
 add_window() {
   title=$(json_escape "$1")
   used=$(awk -v used="$3" 'BEGIN { printf "%.0f", used }')
@@ -131,21 +161,33 @@ add_window() {
   reset=""
   countdown=""
   pace=""
+  mark=""
+  bar_mark=""
   # A reset that has passed belongs to a saved response; the next refresh brings the new window.
   if [ -n "$4" ] && [ "$4" -gt "$now" ]; then
     countdown=$(duration $(($4 - now)))
     reset="Resets in $countdown"
-    # Pace is noise in the first 3% of the week.
+    # Pace is noise in the first 3% of the week. Weekly windows are taken to last 7 days, as Claude's,
+    # Codex's and Antigravity's do.
     if [ "$2" = weekly ] && [ $((604800 - ($4 - now))) -ge 18144 ]; then
       pace=$(weekly_pace "$3" $(($4 - now)))
+      # A mark on the meter where it would be on pace: popup meters are 262 points wide and the bar's
+      # 20, each with its 2- or 1.5-point mark after it.
+      pace_mark popup "$4" 262 2
+      mark=$mark_style
+      if [ "$5" != popup ] && in_bar "$2"; then
+        pace_mark bar "$4" 20 1.5
+        bar_mark=$mark_style
+      fi
     fi
     # Refresh a minute after the reset, when that comes before the next refresh; a response saved before
     # the reset is then more than a minute old, so it's fetched again.
     [ $(($4 - now + 60)) -ge "$interval" ] || interval=$(($4 - now + 60))
   fi
-  rows="$rows${rows:+,}{\"title\":\"$title\",\"fraction\":\"$fraction\",\"detail\":\"$percent% $counted\",\"trailing\":\"$reset\",\"pace\":\"$pace\"}"
-  if in_bar "$2"; then
+  rows="$rows${rows:+,}{\"title\":\"$title\",\"fraction\":\"$fraction\",\"detail\":\"$percent% $counted\",\"trailing\":\"$reset\",\"pace\":\"$pace\",\"brand\":\"$brand\"${mark:+,\"paceMark\":\"1\",\"paceAt\":\"$mark\"}}"
+  if [ "$5" != popup ] && in_bar "$2"; then
     summary="$summary${summary:+ · }$provider $2 $percent% $counted"
+    line="$line${line:+ · }$2 $percent% $counted"
     label=W
     [ "$2" = session ] && label=5h
     group="$group\"${2}Label\":\"$label\","
@@ -154,28 +196,68 @@ add_window() {
     # A window without a countdown, such as a session that hasn't started, keeps its line in the
     # stacked layout, so the week's countdown stays on the week's line.
     [ "$RESET_TIMES" = Hide ] || group="$group\"${2}Reset\":\"${countdown:-–}\","
+    [ "$METERS" = Hide ] || [ -z "$bar_mark" ] || group="$group\"${2}PaceMark\":\"1\",\"${2}PaceAt\":\"$bar_mark\","
   fi
 }
 
-# Adds a provider's section to the popup and, with data, its group to the bar: $1 is its symbol, $2 its
-# title, $3 its usage dashboard and $4 the account's name on the bar, if any.
+# Sets $mark_style to an output style that moves a pace mark, drawn after a meter $3 points wide and itself $4
+# wide, back onto the meter where the week would be on pace, given its reset at $2. The meter fills
+# with what's left or what's used, so the mark sits at the share that should be left or used by now.
+pace_mark() {
+  offset=$(awk -v reset="$2" -v now="$now" -v width="$3" -v mark="$4" -v counted="$counted" 'BEGIN {
+    on = (604800 - (reset - now)) / 604800
+    if (counted != "used") on = 1 - on
+    printf "%d", (on * width - width - mark / 2) * 4 - 0.5
+  }')
+  mark_style="pace-$1$offset"
+  case $pace_styles in *"\"$mark_style\""*) ;; *)
+    pace_styles="$pace_styles,\"$mark_style\":{\"offsetX\":$(awk -v offset="$offset" 'BEGIN { print offset / 4 }')}" ;;
+  esac
+}
+
+# The logo of provider $1, a one-color image drawn in the provider's color, as fields.
+logo() {
+  printf '"logo":"%s","brand":"%s"' "$(json_escape "$PACKAGE_DIR/icons/$1.png")" "$1"
+}
+
+# Adds a provider's section to the popup and, with data, its group to the bar: $1 is its logo, $2 its
+# title, $3 its usage dashboard, if any, and $4 the account's name on the bar, if any. $brand, which
+# colors the rows of its limits, is $1 too.
 add_provider() {
+  image=$(logo "$1")
   plan=$(json_escape "$(printf '%s' "$plan" | awk '{ print toupper(substr($0, 1, 1)) substr($0, 2) }')")
   divider=""
   [ -z "$popup" ] || divider=",\"divider\":\"1\""
-  popup="$popup${popup:+,}{\"header\":\"$(json_escape "$2")\",\"plan\":\"$plan\"$divider}"
+  popup="$popup${popup:+,}{$image,\"header\":\"$(json_escape "$2")\",\"plan\":\"$plan\"$divider}"
   [ -z "$note" ] || popup="$popup,{\"note\":\"$(json_escape "$note")\"}"
-  popup="$popup${rows:+,}$rows,{\"dashboard\":\"$3\"}"
+  [ -z "$notice" ] || popup="$popup,{\"note\":\"$(json_escape "$notice")\"}"
+  popup="$popup${rows:+,}$rows"
+  [ -z "$3" ] || popup="$popup,{\"dashboard\":\"$3\"}"
   if [ -n "$json" ]; then
     look=""
     [ -z "$note" ] || look=",\"look\":\"stale\""
-    bar="$bar${bar:+,}{$group\"symbol\":\"$1\",\"name\":\"$(json_escape "$4")\",\"$arrangement\":\"1\"$columns$look}"
+    bar="$bar${bar:+,}{$group$image,\"name\":\"$(json_escape "$4")\",\"$arrangement\":\"1\"$columns$look}"
     [ "$data_time" -ge "$updated" ] || updated=$data_time
   else
     failures="$failures${failures:+ }$note"
   fi
+  # A line from a saved response says when it was fetched.
+  [ -z "$note" ] || [ -z "$line" ] || line="$line · as of $(date -r "$data_time" +%H:%M)"
+  # A provider on the bar without any of the limits it shows, such as only a week with Session chosen,
+  # says so.
+  [ -z "$json" ] || [ -n "$line" ] || line="none of the limits the bar shows; click for the others"
+  [ -z "$line" ] || tooltip="$tooltip${tooltip:+\\n}$provider: $line"
+  line=""
+  notice=""
   rows=""
   group=""
+  account_done
+}
+
+# Counts an account as done, whether it made a request or not, so that only the accounts still to come
+# share the time left.
+account_done() {
+  [ "$pending" -le 1 ] || pending=$((pending - 1))
 }
 
 # Reads the usage of the Claude Code account whose Keychain sign-in is in $json.
@@ -186,8 +268,10 @@ claude_usage() {
   if [ $((expires / 1000)) -le "$now" ]; then
     use_saved "Claude Code's sign-in has expired; open Claude Code to renew it"
   else
-    fetch -H "Authorization: Bearer $token" -H "anthropic-beta: oauth-2025-04-20" \
-      "https://api.anthropic.com/api/oauth/usage"
+    fetch "https://api.anthropic.com/api/oauth/usage" <<END
+Authorization: Bearer $token
+anthropic-beta: oauth-2025-04-20
+END
   fi
   [ -n "$json" ] || return 0
   total=$(read_json limits)
@@ -219,7 +303,7 @@ claude_usage() {
       fraction=$(awk -v spent="$spent" -v limit="$limit" -v usage="$counted" \
         'BEGIN { used = spent / limit; if (used > 1) used = 1; if (usage != "used") used = 1 - used; printf "%.2f", used }')
       detail=$(awk -v spent="$spent" -v limit="$limit" 'BEGIN { printf "%.2f / %.2f", spent / 100, limit / 100 }')
-      rows="$rows,{\"title\":\"Extra usage\",\"fraction\":\"$fraction\",\"detail\":\"$detail $currency\",\"trailing\":\"This month\"}"
+      rows="$rows,{\"title\":\"Extra usage\",\"fraction\":\"$fraction\",\"detail\":\"$detail $currency\",\"trailing\":\"This month\",\"brand\":\"$brand\"}"
     fi
   fi
 }
@@ -236,15 +320,23 @@ main_suffix=""
 # More Claude Code accounts, as entries such as "Work=~/.claude-work": a name and the folder that
 # CLAUDE_CONFIG_DIR names for that account, or the folder alone. The Claude setting covers them too.
 extras=""
-[ "$CLAUDE" = Off ] || extras=$CLAUDE_ACCOUNTS
+# One entry per line, without blank entries, so that counting and reading them agree.
+[ "$CLAUDE" = Off ] || extras=$(printf '%s' "$CLAUDE_ACCOUNTS" | tr ',' '\n' | sed 's/^ *//; s/ *$//' | grep -v '^$' || true)
 
 # With more than one account on, the widget shows the ones signed in on this Mac. One on alone must be.
 show_claude=true
 show_codex=true
+show_antigravity=true
 [ "$CLAUDE" != Off ] || show_claude=false
 [ "$CODEX" != Off ] || show_codex=false
+[ "$ANTIGRAVITY" != Off ] || show_antigravity=false
+on=0
+for shown in $show_claude $show_codex $show_antigravity; do
+  ! $shown || on=$((on + 1))
+done
+[ -z "$extras" ] || on=$((on + 1))
 both=false
-$show_claude && { $show_codex || [ -n "$extras" ]; } && both=true
+[ "$on" -le 1 ] || both=true
 
 if $show_claude; then
   status=0
@@ -269,23 +361,55 @@ if $show_codex && [ ! -f "$HOME/.codex/auth.json" ]; then
   show_codex=false
 fi
 
-if ! $show_claude && ! $show_codex && [ -z "$extras" ]; then
-  echo "Neither Claude Code nor Codex is signed in on this Mac." >&2
+# Antigravity keeps its Google sign-in in the Keychain, as JSON or as "go-keyring-base64:" and the JSON
+# in Base64. With other providers on, a sign-in that can't be read is a note in Antigravity's section.
+signin_problem=""
+if $show_antigravity; then
+  status=0
+  signin=$(security find-generic-password -s gemini -a antigravity -w 2>/dev/null) || status=$?
+  case $signin in
+    go-keyring-base64:*) signin=$(printf '%s' "${signin#go-keyring-base64:}" | base64 -D 2>/dev/null) || signin="" ;;
+  esac
+  if [ "$status" = 44 ] && $both; then
+    show_antigravity=false
+  elif [ "$status" = 44 ]; then
+    echo "Antigravity isn't signed in on this Mac. Sign in to Antigravity to see its limits." >&2
+    exit 1
+  elif [ "$status" != 0 ] || ! printf '%s' "$signin" | plutil -extract token.access_token raw -o - - >/dev/null 2>&1; then
+    signin_problem="StableBar couldn't read Antigravity's sign-in from the Keychain."
+    if ! $both; then
+      echo "$signin_problem" >&2
+      exit 1
+    fi
+  fi
+fi
+
+if ! $show_claude && ! $show_codex && ! $show_antigravity && [ -z "$extras" ]; then
+  echo "None of Claude Code, Codex and Antigravity is signed in on this Mac." >&2
   exit 1
 fi
 
+# The accounts still to come, each with at most one request, which share the time left.
+pending=0
+for shown in $show_claude $show_codex $show_antigravity; do
+  ! $shown || pending=$((pending + 1))
+done
+[ -z "$extras" ] || pending=$((pending + $(printf '%s\n' "$extras" | wc -l)))
+[ "$pending" -ge 1 ] || pending=1
+
 if $show_claude; then
-  provider=Claude app="Claude Code" host=api.anthropic.com saved="$CONFIG_DIR/ai-usage-claude$main_suffix.json"
+  provider=Claude app="Claude Code" brand=claude host=api.anthropic.com saved="$CONFIG_DIR/ai-usage-claude$main_suffix.json"
   limits=$CLAUDE
   json=$credentials
   claude_usage
-  add_provider asterisk Claude https://claude.ai/settings/usage ""
+  add_provider claude Claude https://claude.ai/settings/usage ""
 fi
 
 # The Keychain items already shown, so that a folder listed twice, or the main account's, shows once.
 seen="[$main_suffix]"
 while IFS= read -r entry; do
   entry=$(printf '%s' "$entry" | sed 's/^ *//; s/ *$//')
+  # Without extra accounts, the loop reads one empty line.
   [ -n "$entry" ] || continue
   case $entry in
     *=*)
@@ -298,10 +422,10 @@ while IFS= read -r entry; do
   case $folder in \~/*) folder="$HOME/${folder#\~/}" ;; esac
   suffix=""
   [ "$folder" = "$HOME/.claude" ] || suffix=$(hashed "$folder")
-  case $seen in *"[$suffix]"*) continue ;; esac
+  case $seen in *"[$suffix]"*) account_done; continue ;; esac
   seen="${seen}[$suffix]"
   heading=${name:-$written}
-  provider="Claude $(json_escape "$heading")" app="Claude Code" host=api.anthropic.com saved="$CONFIG_DIR/ai-usage-claude$suffix.json"
+  provider="Claude $(json_escape "$heading")" app="Claude Code" brand=claude host=api.anthropic.com saved="$CONFIG_DIR/ai-usage-claude$suffix.json"
   limits=$CLAUDE
   plan=""
   status=0
@@ -314,19 +438,26 @@ while IFS= read -r entry; do
     json="" note="StableBar couldn't read the sign-in for $written from the Keychain."
   fi
   # Only a name the entry gives goes on the bar; the popup and the tooltip name the folder otherwise.
-  add_provider asterisk "Claude · $heading" https://claude.ai/settings/usage "$name"
+  add_provider claude "Claude · $heading" https://claude.ai/settings/usage "$name"
 done <<END
-$(printf '%s' "$extras" | tr ',' '\n')
+$extras
 END
 
 if $show_codex; then
-  provider=Codex app=Codex host=chatgpt.com saved="$CONFIG_DIR/ai-usage-codex.json"
+  provider=Codex app=Codex brand=codex host=chatgpt.com saved="$CONFIG_DIR/ai-usage-codex.json"
   limits=$CODEX
   json=$(cat "$HOME/.codex/auth.json")
-  token=$(read_json tokens.access_token)
-  account=$(read_json tokens.account_id)
-  fetch -H "Authorization: Bearer $token" -H "ChatGPT-Account-Id: $account" \
-    "https://chatgpt.com/backend-api/wham/usage"
+  token=$(read_json tokens.access_token 2>/dev/null || true)
+  account=$(read_json tokens.account_id 2>/dev/null || true)
+  # Signed in with an API key instead of a ChatGPT account, Codex has no plan limits to show.
+  if [ -z "$token" ] || [ -z "$account" ]; then
+    json="" note="Codex isn't signed in with a ChatGPT account, so it has no plan limits to show."
+  else
+    fetch "https://chatgpt.com/backend-api/wham/usage" <<END
+Authorization: Bearer $token
+ChatGPT-Account-Id: $account
+END
+  fi
   plan=""
   if [ -n "$json" ]; then
     plan=$(read_json plan_type)
@@ -342,7 +473,97 @@ if $show_codex; then
       fi
     done
   fi
-  add_provider terminal Codex https://chatgpt.com/codex/settings/usage ""
+  add_provider codex Codex https://chatgpt.com/codex/settings/usage ""
+fi
+
+# Antigravity groups the models that share limits, such as Gemini Models and Claude and GPT models,
+# each with a 5-hour and a weekly limit. The bar shows the group the setting names, and the popup every
+# group. Antigravity renews its sign-in, which lasts an hour, while it runs.
+if $show_antigravity; then
+  provider=Antigravity app=Antigravity brand=antigravity host=aicode.googleapis.com saved="$CONFIG_DIR/ai-usage-antigravity-quota.json"
+  limits=$ANTIGRAVITY
+  plan=""
+  if [ -n "$signin_problem" ]; then
+    json="" note=$signin_problem
+  else
+    json=$signin
+    token=$(read_json token.access_token)
+    expires=$(epoch "$(read_json token.expiry 2>/dev/null || true)" 2>/dev/null || echo 0)
+    if [ "$expires" -le "$now" ]; then
+      use_saved "Antigravity's sign-in has expired; open Antigravity to renew it"
+    else
+      fetch "https://aicode.googleapis.com/v1alpha/remote:getUserQuotaSummary" <<END
+Authorization: Bearer $token
+User-Agent: antigravity
+END
+    fi
+  fi
+  if [ -n "$json" ]; then
+    groups=summary.response.groups
+    total=$(read_json "$groups" 2>/dev/null || echo 0)
+    case $total in '' | *[!0-9]*) total=0 ;; esac
+    # The group on the bar: the first whose name starts with the setting's, such as "Gemini".
+    wanted=$(printf '%s' "$ANTIGRAVITY_MODELS" | tr '[:upper:]' '[:lower:]')
+    shown=""
+    g=0
+    while [ "$g" -lt "$total" ]; do
+      models=$(read_json "$groups.$g.displayName" 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)
+      case $models in "$wanted"*) shown=$g && break ;; esac
+      g=$((g + 1))
+    done
+    if [ -z "$shown" ] && [ "$total" -gt 0 ]; then
+      shown=0
+      notice="Antigravity lists no $ANTIGRAVITY_MODELS models, so the bar shows $(read_json "$groups.0.displayName" 2>/dev/null || printf 'its first group')."
+    fi
+    # The tooltip names the group the bar shows.
+    models=$(read_json "$groups.${shown:-0}.displayName" 2>/dev/null | sed 's/ [Mm]odels$//' || true)
+    provider="Antigravity${models:+ ($(json_escape "$models"))}"
+    g=0
+    while [ "$g" -lt "$total" ]; do
+      models=$(read_json "$groups.$g.displayName" 2>/dev/null | sed 's/ [Mm]odels$//' || true)
+      buckets=$(read_json "$groups.$g.buckets" 2>/dev/null || echo 0)
+      case $buckets in '' | *[!0-9]*) buckets=0 ;; esac
+      # The session first and the week second, as for Claude and Codex, then any other limit.
+      for kind in 5h weekly other; do
+        b=0
+        while [ "$b" -lt "$buckets" ]; do
+          at="$groups.$g.buckets.$b"
+          b=$((b + 1))
+          window=$(read_json "$at.window" 2>/dev/null || true)
+          case $kind:$window in
+            5h:5h | weekly:weekly) ;;
+            other:5h | other:weekly) continue ;;
+            other:*) ;;
+            *) continue ;;
+          esac
+          # A limit without a share left from 0 to 1 measures nothing to show.
+          left=$(read_json "$at.remainingFraction" 2>/dev/null || true)
+          awk -v left="$left" 'BEGIN { exit !(left ~ /^([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][-+]?[0-9]+)?$/ && left + 0 <= 1) }' || continue
+          used=$(awk -v left="$left" 'BEGIN { printf "%.2f", 100 - left * 100 }')
+          # A window that hasn't started has no reset time.
+          resets=$(read_json "$at.resetTime" 2>/dev/null || true)
+          [ -z "$resets" ] || resets=$(epoch "$resets" 2>/dev/null || true)
+          # Only the shown group's limits go on the bar.
+          where=popup
+          [ "$g" != "$shown" ] || where=bar
+          case $window in
+            5h) add_window "${models:+$models · }Session" session "$used" "$resets" "$where" ;;
+            weekly) add_window "${models:+$models · }Weekly" weekly "$used" "$resets" "$where" ;;
+            *) add_window "${models:+$models · }$(read_json "$at.displayName" 2>/dev/null || printf Limit)" group "$used" "$resets" ;;
+          esac
+        done
+      done
+      g=$((g + 1))
+    done
+    # Without a limit for the bar, as the setting chooses them, the bar shows Antigravity's logo, which
+    # opens the popup and its limits, or, without any limit, Antigravity shows in the popup only.
+    if [ -z "$rows" ]; then
+      json="" note="Antigravity reported no limits."
+    elif [ -z "$group" ]; then
+      notice="${notice:+$notice }Antigravity reported none of the limits the bar shows."
+    fi
+  fi
+  add_provider antigravity Antigravity "" ""
 fi
 
 if [ -z "$bar" ]; then
@@ -350,5 +571,11 @@ if [ -z "$bar" ]; then
   exit 1
 fi
 
-printf '{"text":"%s","tooltip":"%s","interval":%s,"styles":{"stale":{"opacity":0.55}},"fields":{"updated":"Updated at %s"},"lists":{"popup":[%s],"bar":[%s]}}\n' \
-  "$summary" "$summary" "$interval" "$(date -r "$updated" +%H:%M)" "$popup" "$bar"
+# Each provider's color: Claude's orange, OpenAI's green and Google's blue.
+styles='"stale":{"opacity":0.55}'"$pace_styles"
+for brand in claude:D97757 codex:10A37F antigravity:4285F4; do
+  styles="$styles,\"${brand%%:*}\":{\"foreground\":\"#${brand#*:}\",\"accent\":\"#${brand#*:}\"}"
+done
+
+printf '{"text":"%s","tooltip":"%s","interval":%s,"styles":{%s},"fields":{"updated":"Updated at %s"},"lists":{"popup":[%s],"bar":[%s]}}\n' \
+  "$summary" "$tooltip" "$interval" "$styles" "$(date -r "$updated" +%H:%M)" "$popup" "$bar"
