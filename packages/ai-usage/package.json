@@ -1,13 +1,13 @@
 {
   "id": "ai-usage",
   "name": "AI usage",
-  "version": "1.5.0",
-  "description": "Shows your Claude Code, Codex and Antigravity limits in one widget, with reset countdowns and weekly pace, using the sign-ins those tools already keep.",
+  "version": "1.5.1",
+  "description": "Shows your Claude Code, Codex and Antigravity limits in one widget, with reset countdowns and weekly pace, using the sign-ins those tools already keep and renewing Antigravity's sign-in with its CLI (agy) when installed.",
   "author": "Seb-GRAF",
   "repository": "https://github.com/Seb-GRAF/stablebar-packages",
   "entry": "config.json",
   "screenshot": "preview.png",
-  "hosts": ["api.anthropic.com", "chatgpt.com", "aicode.googleapis.com"],
+  "hosts": ["api.anthropic.com", "chatgpt.com", "aicode.googleapis.com", "oauth2.googleapis.com"],
   "settings": {
     "claude": {
       "type": "string", "title": "Claude", "default": "Session and week", "choices": ["Session and week", "Session", "Week", "Off"],

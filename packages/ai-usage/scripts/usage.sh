@@ -25,6 +25,15 @@ epoch() {
   date -j -f %Y-%m-%dT%H:%M:%S%z "$(printf '%s' "$1" | cut -c 1-19)${zone:-+0000}" +%s
 }
 
+# Formats epoch $1 as HH:MM when it's today, or "Mon 18:15" when it's another day.
+when_time() {
+  if [ "$(date -r "$1" +%Y-%m-%d)" = "$(date -r "$now" +%Y-%m-%d)" ]; then
+    date -r "$1" +%H:%M
+  else
+    date -r "$1" '+%a %H:%M'
+  fi
+}
+
 weekly_pace() {
   elapsed=$((604800 - $2))
   [ "$elapsed" -gt 0 ] || elapsed=0
@@ -75,7 +84,8 @@ fetch() {
   result=$(curl -sS --max-time "$share" -H @- -o "$saved.part" -w '%{http_code} %header{retry-after}' "$@") || curl_status=$?
   # A transfer cut short, such as by the deadline, can still report 200; keep the saved response then.
   [ "$curl_status" = 0 ] || result="000 "
-  case ${result%% *} in
+  fetch_status=${result%% *}
+  case $fetch_status in
     200)
       mv "$saved.part" "$saved"
       json=$(cat "$saved")
@@ -122,6 +132,7 @@ tooltip=""
 line=""
 # A note in a provider's popup section that, unlike $note, doesn't dim it on the bar.
 notice=""
+expired_idle=false
 # The output styles that place pace marks.
 pace_styles=""
 popup=""
@@ -147,17 +158,28 @@ in_bar() {
   return 1
 }
 
-# Adds window $2 (session, weekly, or another kind the bar doesn't show) titled $1, with $3 percent used,
-# resetting at $4, if known. A fifth argument, "popup", keeps it off the bar.
+# Adds window $2 (session, weekly, or another kind the bar doesn't show) titled $1, with $3 percent used
+# (or empty when unknown after a passed reset), resetting at $4, if known. A fifth argument, "popup",
+# keeps it off the bar.
 add_window() {
   title=$(json_escape "$1")
-  used=$(awk -v used="$3" 'BEGIN { printf "%.0f", used }')
-  if [ "$counted" = used ]; then
-    percent=$used
+  if [ -z "$3" ]; then
+    fraction="0.00"
+    detail="–"
+    bar_percent="–"
+    label_text="–"
   else
-    percent=$((100 - used))
+    used=$(awk -v used="$3" 'BEGIN { printf "%.0f", used }')
+    if [ "$counted" = used ]; then
+      percent=$used
+    else
+      percent=$((100 - used))
+    fi
+    fraction=$(awk -v percent="$percent" 'BEGIN { printf "%.2f", percent / 100 }')
+    detail="$percent% $counted"
+    bar_percent="$percent%"
+    label_text="$percent% $counted"
   fi
-  fraction=$(awk -v percent="$percent" 'BEGIN { printf "%.2f", percent / 100 }')
   reset=""
   countdown=""
   pace=""
@@ -169,7 +191,7 @@ add_window() {
     reset="Resets in $countdown"
     # Pace is noise in the first 3% of the week. Weekly windows are taken to last 7 days, as Claude's,
     # Codex's and Antigravity's do.
-    if [ "$2" = weekly ] && [ $((604800 - ($4 - now))) -ge 18144 ]; then
+    if [ "$2" = weekly ] && [ -n "$3" ] && [ $((604800 - ($4 - now))) -ge 18144 ]; then
       pace=$(weekly_pace "$3" $(($4 - now)))
       # A mark on the meter where it would be on pace: popup meters are 262 points wide and the bar's
       # 20, each with its 2- or 1.5-point mark after it.
@@ -184,15 +206,15 @@ add_window() {
     # the reset is then more than a minute old, so it's fetched again.
     [ $(($4 - now + 60)) -ge "$interval" ] || interval=$(($4 - now + 60))
   fi
-  rows="$rows${rows:+,}{\"title\":\"$title\",\"fraction\":\"$fraction\",\"detail\":\"$percent% $counted\",\"trailing\":\"$reset\",\"pace\":\"$pace\",\"brand\":\"$brand\"${mark:+,\"paceMark\":\"1\",\"paceAt\":\"$mark\"}}"
+  rows="$rows${rows:+,}{\"title\":\"$title\",\"fraction\":\"$fraction\",\"detail\":\"$detail\",\"trailing\":\"$reset\",\"pace\":\"$pace\",\"brand\":\"$brand\"${mark:+,\"paceMark\":\"1\",\"paceAt\":\"$mark\"}}"
   if [ "$5" != popup ] && in_bar "$2"; then
-    summary="$summary${summary:+ · }$provider $2 $percent% $counted"
-    line="$line${line:+ · }$2 $percent% $counted"
+    summary="$summary${summary:+ · }$provider $2 $label_text"
+    line="$line${line:+ · }$2 $label_text"
     label=W
     [ "$2" = session ] && label=5h
     group="$group\"${2}Label\":\"$label\","
     [ "$METERS" = Hide ] || group="$group\"${2}Meter\":\"$fraction\","
-    [ "$PERCENTAGES" = Hide ] || group="$group\"${2}Percent\":\"$percent%\","
+    [ "$PERCENTAGES" = Hide ] || group="$group\"${2}Percent\":\"$bar_percent\","
     # A window without a countdown, such as a session that hasn't started, keeps its line in the
     # stacked layout, so the week's countdown stays on the week's line.
     [ "$RESET_TIMES" = Hide ] || group="$group\"${2}Reset\":\"${countdown:-–}\","
@@ -242,13 +264,16 @@ add_provider() {
     failures="$failures${failures:+ }$note"
   fi
   # A line from a saved response says when it was fetched.
-  [ -z "$note" ] || [ -z "$line" ] || line="$line · as of $(date -r "$data_time" +%H:%M)"
+  if [ -n "$line" ] && { [ -n "$note" ] || $expired_idle; }; then
+    line="$line · as of $(when_time "$data_time")"
+  fi
   # A provider on the bar without any of the limits it shows, such as only a week with Session chosen,
   # says so.
   [ -z "$json" ] || [ -n "$line" ] || line="none of the limits the bar shows; click for the others"
   [ -z "$line" ] || tooltip="$tooltip${tooltip:+\\n}$provider: $line"
   line=""
   notice=""
+  expired_idle=false
   rows=""
   group=""
   account_done
@@ -369,15 +394,104 @@ if $show_codex && [ ! -f "$HOME/.codex/auth.json" ]; then
   show_codex=false
 fi
 
+# Reads Antigravity's Google sign-in from the Keychain, decoding go-keyring-base64 if present.
+read_antigravity_signin() {
+  signin_status=0
+  signin=$(security find-generic-password -s gemini -a antigravity -w 2>/dev/null) || signin_status=$?
+  case $signin in
+    go-keyring-base64:*) signin=$(printf '%s' "${signin#go-keyring-base64:}" | base64 -D 2>/dev/null) || signin="" ;;
+  esac
+}
+
+# Finds the Antigravity CLI (`agy`), skipping any symlink into a macOS .app bundle so a desktop app
+# launcher isn't started from the bar.
+find_antigravity_cli() {
+  for candidate in \
+    "$(command -v agy 2>/dev/null || true)" \
+    "$HOME/.local/bin/agy" \
+    /opt/homebrew/bin/agy \
+    /usr/local/bin/agy; do
+    [ -n "$candidate" ] && [ -x "$candidate" ] || continue
+    target=$candidate
+    depth=0
+    while [ -L "$target" ] && [ "$depth" -lt 10 ]; do
+      link=$(readlink "$target" 2>/dev/null || true)
+      [ -n "$link" ] || break
+      case $link in
+        /*) target=$link ;;
+        *) target="$(dirname "$target")/$link" ;;
+      esac
+      depth=$((depth + 1))
+    done
+    case $target in *.app/* | *.app) continue ;; esac
+    printf '%s' "$candidate"
+    return 0
+  done
+  return 1
+}
+
+# Asks the local Antigravity CLI (`agy`) to refresh its 1-hour access token in Keychain, using its
+# saved refresh token. Capped to a few seconds and backed off on failure so it never stalls the widget.
+renew_antigravity_signin() {
+  refresh_wait="$CONFIG_DIR/ai-usage-antigravity-refresh-wait"
+  if [ -f "$refresh_wait" ] && [ "$now" -lt "$(cat "$refresh_wait")" ]; then
+    return 1
+  fi
+  refresh_token=$(printf '%s' "$signin" | plutil -extract token.refresh_token raw -o - - 2>/dev/null || true)
+  [ -n "$refresh_token" ] || return 1
+  cli=$(find_antigravity_cli 2>/dev/null || true)
+  [ -n "$cli" ] || return 1
+  left=$((deadline - $(date +%s)))
+  [ "$left" -ge 5 ] || return 1
+  cap=$((left - 2))
+  [ "$cap" -le 6 ] || cap=6
+  (cd / && AGY_CLI_DISABLE_AUTO_UPDATE=true exec "$cli" models) </dev/null >/dev/null 2>&1 &
+  cli_pid=$!
+  ticks=0
+  limit=$((cap * 5))
+  while kill -0 "$cli_pid" 2>/dev/null && [ "$ticks" -lt "$limit" ]; do
+    sleep 0.2
+    ticks=$((ticks + 1))
+  done
+  cli_status=0
+  if kill -0 "$cli_pid" 2>/dev/null; then
+    kill "$cli_pid" 2>/dev/null || true
+    grace=0
+    while kill -0 "$cli_pid" 2>/dev/null && [ "$grace" -lt 5 ]; do
+      sleep 0.2
+      grace=$((grace + 1))
+    done
+    if kill -0 "$cli_pid" 2>/dev/null; then
+      kill -9 "$cli_pid" 2>/dev/null || true
+    fi
+    wait "$cli_pid" 2>/dev/null || true
+    cli_status=124
+  else
+    wait "$cli_pid" 2>/dev/null || cli_status=$?
+  fi
+  if [ "$cli_status" = 0 ]; then
+    read_antigravity_signin
+    if [ "$signin_status" = 0 ]; then
+      new_token=$(printf '%s' "$signin" | plutil -extract token.access_token raw -o - - 2>/dev/null || true)
+      new_expires=$(epoch "$(printf '%s' "$signin" | plutil -extract token.expiry raw -o - - 2>/dev/null || true)" 2>/dev/null || true)
+      if [ -n "$new_token" ] && [ "$new_token" != "$token" ] && { [ -z "$new_expires" ] || [ "$new_expires" -gt "$now" ]; }; then
+        token=$new_token
+        expires=$new_expires
+        rm -f "$refresh_wait"
+        return 0
+      fi
+    fi
+  fi
+  echo $((now + 900)) > "$refresh_wait"
+  return 1
+}
+
 # Antigravity keeps its Google sign-in in the Keychain, as JSON or as "go-keyring-base64:" and the JSON
 # in Base64. With other providers on, a sign-in that can't be read is a note in Antigravity's section.
 signin_problem=""
 if $show_antigravity; then
-  status=0
-  signin=$(security find-generic-password -s gemini -a antigravity -w 2>/dev/null) || status=$?
-  case $signin in
-    go-keyring-base64:*) signin=$(printf '%s' "${signin#go-keyring-base64:}" | base64 -D 2>/dev/null) || signin="" ;;
-  esac
+  read_antigravity_signin
+  status=$signin_status
   if [ "$status" = 44 ] && $both; then
     show_antigravity=false
   elif [ "$status" = 44 ]; then
@@ -486,11 +600,13 @@ fi
 
 # Antigravity groups the models that share limits, such as Gemini Models and Claude and GPT models,
 # each with a 5-hour and a weekly limit. The bar shows the group the setting names, and the popup every
-# group. Antigravity renews its sign-in, which lasts an hour, while it runs.
+# group. Google access tokens last an hour; when expired, try renewing through the local CLI first,
+# and otherwise show the last saved limits calmly while Antigravity is idle.
 if $show_antigravity; then
   provider=Antigravity app=Antigravity brand=antigravity host=aicode.googleapis.com saved="$CONFIG_DIR/ai-usage-antigravity-quota.json"
   limits=$ANTIGRAVITY
   plan=""
+  expired_idle=false
   if [ -n "$signin_problem" ]; then
     json="" note=$signin_problem
   else
@@ -498,13 +614,39 @@ if $show_antigravity; then
     token=$(read_json token.access_token)
     # An expiry that's missing or unreadable is unknown: the request then tells whether it still works.
     expires=$(epoch "$(read_json token.expiry 2>/dev/null || true)" 2>/dev/null || true)
+    renewed=false
     if [ -n "$expires" ] && [ "$expires" -le "$now" ]; then
-      use_saved "Antigravity's sign-in has expired; open Antigravity to renew it"
-    else
+      if renew_antigravity_signin; then
+        renewed=true
+      elif [ -f "$saved" ]; then
+        json=$(cat "$saved")
+        data_time=$(stat -f %m "$saved")
+        since=$(when_time "$data_time")
+        expired_idle=true
+        if [ $((now - data_time)) -lt 18000 ]; then
+          note=""
+          notice="Antigravity hasn't run on this Mac since $since. Open Antigravity to refresh."
+        else
+          note="Antigravity hasn't run on this Mac since $since; open Antigravity to refresh."
+        fi
+      else
+        json=""
+        note="Antigravity's sign-in has expired; open Antigravity to renew it."
+      fi
+    fi
+    if ! $expired_idle && [ -n "$json" ]; then
+      fetch_status=""
       fetch "https://aicode.googleapis.com/v1alpha/remote:getUserQuotaSummary" <<END
 Authorization: Bearer $token
 User-Agent: antigravity
 END
+      # If the token was rejected while its expiry was unknown, renew once through the CLI and retry.
+      if ! $renewed && [ -z "$expires" ] && { [ "$fetch_status" = 401 ] || [ "$fetch_status" = 403 ]; } && renew_antigravity_signin; then
+        fetch "https://aicode.googleapis.com/v1alpha/remote:getUserQuotaSummary" <<END
+Authorization: Bearer $token
+User-Agent: antigravity
+END
+      fi
     fi
   fi
   if [ -n "$json" ]; then
@@ -522,7 +664,7 @@ END
     done
     if [ -z "$shown" ] && [ "$total" -gt 0 ]; then
       shown=0
-      notice="Antigravity lists no $ANTIGRAVITY_MODELS models, so the bar shows $(read_json "$groups.0.displayName" 2>/dev/null || printf 'its first group')."
+      notice="${notice:+$notice }Antigravity lists no $ANTIGRAVITY_MODELS models, so the bar shows $(read_json "$groups.0.displayName" 2>/dev/null || printf 'its first group')."
     fi
     # The tooltip names the group the bar shows.
     models=$(read_json "$groups.${shown:-0}.displayName" 2>/dev/null | sed 's/ [Mm]odels$//' || true)
@@ -552,6 +694,11 @@ END
           # A window that hasn't started has no reset time.
           resets=$(read_json "$at.resetTime" 2>/dev/null || true)
           [ -z "$resets" ] || resets=$(epoch "$resets" 2>/dev/null || true)
+          # While Antigravity hasn't run on this Mac, a window whose reset time has already passed is unknown.
+          if $expired_idle && [ -n "$resets" ] && [ "$resets" -le "$now" ]; then
+            used=""
+            resets=""
+          fi
           # Only the shown group's limits go on the bar.
           where=popup
           [ "$g" != "$shown" ] || where=bar
