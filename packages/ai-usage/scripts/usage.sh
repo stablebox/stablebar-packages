@@ -265,11 +265,12 @@ claude_usage() {
   token=$(read_json claudeAiOauth.accessToken 2>/dev/null || true)
   plan=$(read_json claudeAiOauth.subscriptionType 2>/dev/null || true)
   expires=$(read_json claudeAiOauth.expiresAt 2>/dev/null || true)
-  case $expires in '' | *[!0-9]*) expires=0 ;; esac
+  # An expiry that's missing or not a number is unknown: the request then tells whether it still works.
+  case $expires in *[!0-9]*) expires="" ;; esac
   # A sign-in without a token, such as one the Keychain gave back damaged, is a note, not a failure.
   if [ -z "$token" ]; then
     json="" note="StableBar couldn't read Claude Code's sign-in from the Keychain."
-  elif [ $((expires / 1000)) -le "$now" ]; then
+  elif [ -n "$expires" ] && [ $((expires / 1000)) -le "$now" ]; then
     use_saved "Claude Code's sign-in has expired; open Claude Code to renew it"
   else
     fetch "https://api.anthropic.com/api/oauth/usage" <<END
@@ -495,8 +496,9 @@ if $show_antigravity; then
   else
     json=$signin
     token=$(read_json token.access_token)
-    expires=$(epoch "$(read_json token.expiry 2>/dev/null || true)" 2>/dev/null || echo 0)
-    if [ "$expires" -le "$now" ]; then
+    # An expiry that's missing or unreadable is unknown: the request then tells whether it still works.
+    expires=$(epoch "$(read_json token.expiry 2>/dev/null || true)" 2>/dev/null || true)
+    if [ -n "$expires" ] && [ "$expires" -le "$now" ]; then
       use_saved "Antigravity's sign-in has expired; open Antigravity to renew it"
     else
       fetch "https://aicode.googleapis.com/v1alpha/remote:getUserQuotaSummary" <<END
